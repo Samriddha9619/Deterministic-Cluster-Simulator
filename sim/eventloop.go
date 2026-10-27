@@ -64,12 +64,14 @@ func DefaultSimConfig(seed uint64) SimConfig {
 // TraceEvent is the JSON-serializable record of one event in the trace.
 // It captures everything needed to replay and inspect the run.
 type TraceEvent struct {
-	Index  int       `json:"index"`
-	At     int64     `json:"at_ns"`       // virtual time in nanoseconds
-	AtStr  string    `json:"at"`          // human-readable time
-	Kind   string    `json:"kind"`
-	Target string    `json:"target,omitempty"`
-	Detail string    `json:"detail,omitempty"`
+	Index     int          `json:"index"`
+	At        int64        `json:"at_ns"` // virtual time in nanoseconds
+	AtStr     string       `json:"at"`    // human-readable time
+	Kind      string       `json:"kind"`
+	From      string       `json:"from,omitempty"`
+	Target    string       `json:"target,omitempty"`
+	Detail    string       `json:"detail,omitempty"`
+	Snapshots []t.NodeView `json:"snapshots,omitempty"`
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +197,7 @@ type RunResult struct {
 	Violation     string       `json:"violation,omitempty"`
 	TraceHash     string       `json:"trace_hash"`
 	NodeSnapshots []t.NodeView `json:"node_snapshots"`
+	Trace         []TraceEvent `json:"trace,omitempty"`
 }
 
 // Run executes the simulation until a stopping condition is met:
@@ -231,6 +234,9 @@ func (s *Simulator) Run() RunResult {
 		if evt.Target != 0 {
 			te.Target = evt.Target.String()
 		}
+		if evt.Message != nil && evt.Message.From != 0 {
+			te.From = evt.Message.From.String()
+		}
 		te.Detail = evt.String()
 
 		// Hash the trace event for determinism checking.
@@ -238,11 +244,18 @@ func (s *Simulator) Run() RunResult {
 		// any divergence in event ordering.
 		fmt.Fprintf(hasher, "%d|%d|%d|%d\n", te.Index, te.At, evt.Kind, evt.Target)
 
-		s.trace = append(s.trace, te)
-		s.eventCount++
-
 		// Dispatch the event.
 		s.dispatch(evt)
+
+		// Snapshot cluster state after this event has been handled.
+		snaps := make([]t.NodeView, len(s.nodeIDs))
+		for i, id := range s.nodeIDs {
+			snaps[i] = s.nodes[id].Snapshot()
+		}
+		te.Snapshots = snaps
+
+		s.trace = append(s.trace, te)
+		s.eventCount++
 
 		// Check invariants after every event.
 		if v := s.checkInvariants(); v != "" {
@@ -269,6 +282,7 @@ func (s *Simulator) Run() RunResult {
 		Violation:     s.invariantViolation,
 		TraceHash:     hashStr,
 		NodeSnapshots: snapshots,
+		Trace:         s.trace,
 	}
 }
 

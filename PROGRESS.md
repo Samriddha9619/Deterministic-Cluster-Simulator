@@ -5,8 +5,8 @@
 | Milestone | Title | Status | Description |
 |---|---|---|---|
 | **M0** | Feasibility Spike | **DONE** | 3-node etcd/raft cluster, seeded event loop, network drops & partition, leader-per-term & convergence checks, patched library randomness. |
-| **M1** | Skeleton & First Visual | **NEXT** | Trace JSON emitter, Go HTTP/WebSocket trace server, minimal TypeScript cluster canvas with timeline scrubber. |
-| **M2** | Faults & Disk Subsystem | Pending | Network fault model (asymmetry, delays), crash/restart, volatile vs durable disk buffer with sync, fault plan. |
+| **M1** | Skeleton & First Visual | **DONE** | Trace JSON emitter, Go HTTP server, interactive cluster canvas with timeline scrubber & node inspector. |
+| **M2** | Faults & Disk Subsystem | **NEXT** | Network fault model (asymmetry, delays), crash/restart, volatile vs durable disk buffer with sync, fault plan. |
 | **M3** | Replicated KV & Complete Checkers | Pending | Production Ready ordering, KV state machine, snapshotting & log compaction, client workload generator, history recorder, 6 checkers. |
 | **M4** | Sweep & Shrink Engine | Pending | Parallel seed sweep runner, violation freeze, delta-debugging schedule shrinker. |
 | **M5** | Bug Gallery | Pending | 6 planted bugs behind flags (ack before fsync, wrong quorum, stale term, unpersisted vote, early apply, stale read) + benchmarks. |
@@ -24,3 +24,16 @@
 - [x] **Proposal Forwarding**: Enabled followers to forward client proposals to the cluster leader via Raft messages.
 - [x] **Checkers**: Implemented `CheckOneLeaderPerTerm` and `CheckConvergence` in `/checkers`.
 - [x] **Determinism Verification**: 100/100 seeds tested twice producing identical trace hashes (`Det-Fail: 0`).
+
+---
+
+## M1 Details & Verification
+
+- [x] **Trace JSON Emitter**: Implemented `harness/trace.go` with full metadata, per-event post-dispatch cluster snapshots, and verdicts.
+- [x] **Web & Simulation Server**: Implemented `server/server.go` and `cmd/server/main.go` serving static assets and REST endpoints (`/api/simulate`, `/api/sweep`, `/api/health`).
+- [x] **Frontend Cluster Visualizer**: Implemented `web/index.html`, `web/styles.css`, and `web/app.js` featuring:
+  - Cluster canvas topology with live roles, pulse glows, and message packet animations.
+  - Zero-latency timeline scrubber with play/pause, step backward/forward, and speed controls.
+  - Interactive Node Inspector displaying term, vote, commit index, applied index, and live KV state.
+  - Multi-seed sweep drawer (24 seeds in ~770ms) with direct seed inspection.
+- [x] **End-to-End Browser Validation**: Tested and verified in browser subagent with WebP session recording saved.
