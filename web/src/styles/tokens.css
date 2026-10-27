@@ -1,0 +1,25 @@
+:root {
+  --paper: #efe6d4;
+  --paper-2: #f7f1e4;
+  --ink: #1e1610;
+  --ink-soft: #4a3f34;
+  --mute: #7a6d5b;
+  --rule: #d5c4a8;
+  --rule-strong: #c3ae8e;
+  --moss: #3f5d3a;
+  --moss-soft: #e3ead8;
+  --copper: #c45a2a;
+  --copper-soft: #f3ddd2;
+  --indigo: #2c3d5a;
+  --indigo-soft: #d9e0ea;
+  --wine: #8a2a38;
+  --wine-soft: #f0d6d8;
+  --sand: #cbb892;
+
+  --serif: "Fraunces", "Iowan Old Style", Georgia, serif;
+  --sans: "Manrope", "Segoe UI", sans-serif;
+  --mono: "Azeret Mono", "IBM Plex Mono", ui-monospace, monospace;
+
+  --radius: 2px;
+  --gap: 14px;
+}
