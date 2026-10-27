@@ -80,18 +80,23 @@ type RaftNode struct {
 	// tickInterval is the virtual time between Raft ticks.
 	tickInterval t.Time
 
+	// snapshotThreshold is the number of applied entries before compaction.
+	snapshotThreshold uint64
+	lastSnapshotIndex uint64
+
 	// alive tracks whether this node is currently alive (not crashed).
 	alive bool
 }
 
 // Config holds the parameters for creating a RaftNode.
 type Config struct {
-	ID            t.NodeID
-	Peers         []t.NodeID // all node IDs in the cluster (including self)
-	ElectionTick  int        // election timeout in ticks
-	HeartbeatTick int        // heartbeat interval in ticks
-	TickInterval  t.Time     // virtual time per tick
-	Rand          t.Rand     // deterministic random source
+	ID                t.NodeID
+	Peers             []t.NodeID // all node IDs in the cluster (including self)
+	ElectionTick      int        // election timeout in ticks
+	HeartbeatTick     int        // heartbeat interval in ticks
+	TickInterval      t.Time     // virtual time per tick
+	Rand              t.Rand     // deterministic random source
+	SnapshotThreshold uint64     // entries applied before triggering snapshot & compaction (0 for default 50)
 }
 
 // discardLogger implements raft.Logger by discarding all output. We don't
@@ -137,6 +142,8 @@ func NewRaftNode(cfg Config) (*RaftNode, error) {
 		MaxInflightMsgs: 256,
 		Logger:          discardLogger{},
 		Rand:            cfg.Rand,
+		PreVote:         true,
+		CheckQuorum:     true,
 	}
 
 	raw, err := raft.NewRawNode(raftCfg)
@@ -149,16 +156,22 @@ func NewRaftNode(cfg Config) (*RaftNode, error) {
 		return nil, fmt.Errorf("raftnode: bootstrap: %w", err)
 	}
 
+	snapThreshold := cfg.SnapshotThreshold
+	if snapThreshold == 0 {
+		snapThreshold = 50
+	}
+
 	return &RaftNode{
-		cfg:              cfg,
-		id:               cfg.ID,
-		raw:              raw,
-		storage:          storage,
-		kv:               kv.NewStore(),
-		peers:            cfg.Peers,
-		pendingProposals: make(map[uint64]t.ClientReq),
-		tickInterval:     cfg.TickInterval,
-		alive:            true,
+		cfg:               cfg,
+		id:                cfg.ID,
+		raw:               raw,
+		storage:           storage,
+		kv:                kv.NewStore(),
+		peers:             cfg.Peers,
+		pendingProposals:  make(map[uint64]t.ClientReq),
+		tickInterval:      cfg.TickInterval,
+		snapshotThreshold: snapThreshold,
+		alive:             true,
 	}, nil
 }
 
@@ -213,21 +226,8 @@ func (n *RaftNode) OnClient(now t.Time, req t.ClientReq) t.Output {
 	}
 
 
-	// For Get operations, read directly from the applied state.
-	// NOTE: This is a simplification for M0 — a proper linearizable read
-	// requires a read-index or lease check.
-	if req.Op == t.OpGet {
-		val, _ := n.kv.Get(req.Key)
-		return t.Output{
-			Responses: []t.ClientResp{{
-				RequestID: req.RequestID,
-				OK:        true,
-				Value:     val,
-			}},
-		}
-	}
-
-	// For write operations, create a KV command and propose it to Raft.
+	// For all operations (Put, Get, Delete, CAS), route through Raft consensus
+	// to guarantee linearizability and prevent stale dirty reads.
 	cmd := kv.Command{
 		RequestID: req.RequestID,
 		ClientID:  req.ClientID,
@@ -239,6 +239,8 @@ func (n *RaftNode) OnClient(now t.Time, req t.ClientReq) t.Output {
 	switch req.Op {
 	case t.OpPut:
 		cmd.Type = kv.CmdPut
+	case t.OpGet:
+		cmd.Type = kv.CmdGet
 	case t.OpDelete:
 		cmd.Type = kv.CmdDelete
 	case t.OpCAS:
@@ -309,6 +311,8 @@ func (n *RaftNode) OnDiskDone(now t.Time, result t.DiskOpResult) t.Output {
 			output.Responses = append(output.Responses, resps...)
 		}
 
+		n.maybeTriggerSnapshot()
+
 		// Tell Raft we've processed this Ready.
 		n.raw.Advance(raft.Ready{})
 	}
@@ -344,6 +348,10 @@ func (n *RaftNode) OnRestart(now t.Time, durable t.DiskImage) t.Output {
 	storage := raft.NewMemoryStorage()
 	if state.Snapshot != nil && !raft.IsEmptySnap(state.Snapshot) {
 		_ = storage.ApplySnapshot(state.Snapshot)
+		if len(state.Snapshot.Data) > 0 {
+			_ = n.kv.Restore(state.Snapshot.Data)
+		}
+		n.lastSnapshotIndex = state.Snapshot.Metadata.GetIndex()
 	}
 	if len(state.Entries) > 0 {
 		ents := make([]*pb.Entry, len(state.Entries))
@@ -378,6 +386,8 @@ func (n *RaftNode) OnRestart(now t.Time, durable t.DiskImage) t.Output {
 		MaxInflightMsgs: 256,
 		Logger:          discardLogger{},
 		Rand:            n.cfg.Rand,
+		PreVote:         true,
+		CheckQuorum:     true,
 	}
 	raw, err := raft.NewRawNode(raftCfg)
 	if err != nil {
@@ -412,6 +422,21 @@ func (n *RaftNode) Snapshot() t.NodeView {
 			view.Role = t.RoleCandidate
 		case raft.StateLeader:
 			view.Role = t.RoleLeader
+		}
+
+		if first, err := n.storage.FirstIndex(); err == nil {
+			if last, err := n.storage.LastIndex(); err == nil && last >= first {
+				view.LogLength = last
+				if ents, err := n.storage.Entries(first, last+1, 0); err == nil {
+					view.LogEntries = make([]t.LogEntrySummary, len(ents))
+					for i, e := range ents {
+						view.LogEntries[i] = t.LogEntrySummary{
+							Index: e.GetIndex(),
+							Term:  e.GetTerm(),
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -453,6 +478,20 @@ func (n *RaftNode) drainReady(now t.Time) t.Output {
 		if err := n.storage.ApplySnapshot(rd.Snapshot); err != nil {
 			panic(fmt.Sprintf("raftnode: apply snapshot: %v", err))
 		}
+		if len(rd.Snapshot.Data) > 0 {
+			if err := n.kv.Restore(rd.Snapshot.Data); err != nil {
+				panic(fmt.Sprintf("raftnode: restore snapshot: %v", err))
+			}
+		}
+		snapIdx := rd.Snapshot.Metadata.GetIndex()
+		if snapIdx > n.appliedIndex {
+			n.appliedIndex = snapIdx
+		}
+		n.lastSnapshotIndex = snapIdx
+		snapCopy := *rd.Snapshot
+		n.durableState.Snapshot = &snapCopy
+		n.durableState.Applied = n.appliedIndex
+		n.durableState.KVState = n.kv.Clone()
 	}
 
 	if rd.MustSync {
@@ -485,6 +524,8 @@ func (n *RaftNode) drainReady(now t.Time) t.Output {
 			resps := n.applyEntry(entry)
 			output.Responses = append(output.Responses, resps...)
 		}
+
+		n.maybeTriggerSnapshot()
 
 		n.raw.Advance(raft.Ready{})
 	}
@@ -556,6 +597,34 @@ func (n *RaftNode) serializeForDisk(rd raft.Ready) []byte {
 
 	data, _ := json.Marshal(n.durableState)
 	return data
+}
+
+// maybeTriggerSnapshot checks if applied entries exceed snapshotThreshold and takes a snapshot.
+func (n *RaftNode) maybeTriggerSnapshot() {
+	if n.snapshotThreshold == 0 || n.appliedIndex <= n.lastSnapshotIndex {
+		return
+	}
+	if n.appliedIndex-n.lastSnapshotIndex < n.snapshotThreshold {
+		return
+	}
+	data, err := n.kv.Serialize()
+	if err != nil {
+		return
+	}
+	var cs pb.ConfState
+	for _, p := range n.peers {
+		cs.Voters = append(cs.Voters, uint64(p))
+	}
+	snap, err := n.storage.CreateSnapshot(n.appliedIndex, &cs, data)
+	if err != nil {
+		return
+	}
+	_ = n.storage.Compact(n.appliedIndex)
+	n.lastSnapshotIndex = n.appliedIndex
+	snapCopy := *snap
+	n.durableState.Snapshot = &snapCopy
+	n.durableState.Applied = n.appliedIndex
+	n.durableState.KVState = n.kv.Clone()
 }
 
 // SetAlive sets whether this node is alive. Used by the event loop for

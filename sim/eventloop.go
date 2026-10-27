@@ -2,10 +2,13 @@ package sim
 
 import (
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"sort"
 
+	"github.com/Samriddha9619/deterministic-cluster-simulator/checkers"
+	"github.com/Samriddha9619/deterministic-cluster-simulator/harness"
 	"github.com/Samriddha9619/deterministic-cluster-simulator/node/raftnode"
 	t "github.com/Samriddha9619/deterministic-cluster-simulator/types"
 )
@@ -112,6 +115,12 @@ type Simulator struct {
 
 	// faultPlan is the active schedule of faults.
 	faultPlan *FaultPlan
+
+	// history records client calls and returns for linearizability checks.
+	history *harness.HistoryRecorder
+
+	// durability verifies acknowledged writes survive across crashes.
+	durability *checkers.DurabilityChecker
 }
 
 // NewSimulator creates and initializes a simulator from the given config.
@@ -188,6 +197,8 @@ func NewSimulator(cfg SimConfig) (*Simulator, error) {
 		masterRand: masterRand,
 		trace:      make([]TraceEvent, 0, cfg.MaxEvents),
 		faultPlan:  faultPlan,
+		history:    harness.NewHistoryRecorder(),
+		durability: checkers.NewDurabilityChecker(),
 	}
 
 	// Schedule the fault plan if present.
@@ -214,15 +225,16 @@ func NewSimulator(cfg SimConfig) (*Simulator, error) {
 
 // RunResult is the outcome of a simulation run.
 type RunResult struct {
-	Seed          uint64       `json:"seed"`
-	EventCount    int          `json:"event_count"`
-	FinalTime     t.Time       `json:"final_time_ns"`
-	FinalTimeStr  string       `json:"final_time"`
-	Violation     string       `json:"violation,omitempty"`
-	TraceHash     string       `json:"trace_hash"`
-	NodeSnapshots []t.NodeView `json:"node_snapshots"`
-	Trace         []TraceEvent `json:"trace,omitempty"`
-	FaultPlan     *FaultPlan   `json:"fault_plan,omitempty"`
+	Seed          uint64                 `json:"seed"`
+	EventCount    int                    `json:"event_count"`
+	FinalTime     t.Time                 `json:"final_time_ns"`
+	FinalTimeStr  string                 `json:"final_time"`
+	Violation     string                 `json:"violation,omitempty"`
+	TraceHash     string                 `json:"trace_hash"`
+	NodeSnapshots []t.NodeView           `json:"node_snapshots"`
+	Trace         []TraceEvent           `json:"trace,omitempty"`
+	FaultPlan     *FaultPlan             `json:"fault_plan,omitempty"`
+	History       []harness.HistoryEntry `json:"history,omitempty"`
 }
 
 // Run executes the simulation until a stopping condition is met:
@@ -273,10 +285,7 @@ func (s *Simulator) Run() RunResult {
 		s.dispatch(evt)
 
 		// Snapshot cluster state after this event has been handled.
-		snaps := make([]t.NodeView, len(s.nodeIDs))
-		for i, id := range s.nodeIDs {
-			snaps[i] = s.nodes[id].Snapshot()
-		}
+		snaps := s.NodeSnapshots()
 		te.Snapshots = snaps
 
 		s.trace = append(s.trace, te)
@@ -289,14 +298,30 @@ func (s *Simulator) Run() RunResult {
 		}
 	}
 
+	// Finalize any pending client requests as indeterminate.
+	s.history.FinalizeIndeterminate(s.clock.Now())
+	for _, entry := range s.history.Entries() {
+		if entry.Kind == harness.KindInfo {
+			s.durability.RecordIndeterminate(entry)
+		}
+	}
+
 	// Compute final trace hash.
 	hashBytes := hasher.Sum(nil)
-	hashStr := fmt.Sprintf("%x", hashBytes)
+	hashStr := hex.EncodeToString(hashBytes)
 
 	// Collect final node snapshots.
-	snapshots := make([]t.NodeView, len(s.nodeIDs))
-	for i, id := range s.nodeIDs {
-		snapshots[i] = s.nodes[id].Snapshot()
+	snapshots := s.NodeSnapshots()
+
+	// If no online violation occurred, check quiescent convergence, durability, and linearizability.
+	if s.invariantViolation == "" {
+		if v := checkers.CheckConvergence(snapshots); v != nil {
+			s.invariantViolation = v.String()
+		} else if v := s.durability.CheckFinalState(snapshots); v != nil {
+			s.invariantViolation = v.String()
+		} else if v := checkers.CheckLinearizability(s.history.Entries()); v != nil {
+			s.invariantViolation = v.String()
+		}
 	}
 
 	return RunResult{
@@ -309,7 +334,22 @@ func (s *Simulator) Run() RunResult {
 		NodeSnapshots: snapshots,
 		Trace:         s.trace,
 		FaultPlan:     s.faultPlan,
+		History:       s.history.Entries(),
 	}
+}
+
+// NodeSnapshots returns the current view of all nodes in sorted order.
+func (s *Simulator) NodeSnapshots() []t.NodeView {
+	snaps := make([]t.NodeView, len(s.nodeIDs))
+	for i, id := range s.nodeIDs {
+		snaps[i] = s.nodes[id].Snapshot()
+	}
+	return snaps
+}
+
+// History returns a copy of the simulation's recorded client history.
+func (s *Simulator) History() []harness.HistoryEntry {
+	return s.history.Entries()
 }
 
 // ---------------------------------------------------------------------------
@@ -392,6 +432,8 @@ func (s *Simulator) handleClientReq(evt *Event) {
 	if evt.ClientReq == nil {
 		return
 	}
+	s.history.RecordInvoke(s.clock.Now(), *evt.ClientReq)
+
 	node, ok := s.nodes[evt.Target]
 	if !ok || !s.network.IsAlive(evt.Target) {
 		return
@@ -429,6 +471,13 @@ func (s *Simulator) handleRestart(evt *Event) {
 	durable := disk.DurableImage()
 	output := node.OnRestart(s.clock.Now(), durable)
 	s.processOutput(evt.Target, output)
+
+	// Reschedule ticks for the restarted node so it can participate in elections and heartbeats.
+	s.queue.Enqueue(&Event{
+		At:     s.clock.Now() + s.config.TickInterval,
+		Kind:   EventTick,
+		Target: evt.Target,
+	})
 }
 
 // handleCrash crashes a node, wiping its volatile disk state.
@@ -549,8 +598,12 @@ func (s *Simulator) processOutput(nodeID t.NodeID, output t.Output) {
 		})
 	}
 
-	// Client responses are recorded but not re-enqueued (the harness
-	// collects them from the trace). For M0, we just record them.
+	// Process client responses.
+	for _, resp := range output.Responses {
+		if entry, ok := s.history.RecordReturn(now, resp); ok && entry.Kind == harness.KindOK {
+			s.durability.RecordAck(entry)
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -560,7 +613,14 @@ func (s *Simulator) processOutput(nodeID t.NodeID, output t.Output) {
 // checkInvariants runs cheap invariant checks after every event.
 // Returns a non-empty string describing the first violation found.
 func (s *Simulator) checkInvariants() string {
-	return s.checkOneLeaderPerTerm()
+	snaps := s.NodeSnapshots()
+	if v := checkers.CheckOneLeaderPerTerm(snaps); v != nil {
+		return v.String()
+	}
+	if v := checkers.CheckLogMatching(snaps); v != nil {
+		return v.String()
+	}
+	return ""
 }
 
 // checkOneLeaderPerTerm verifies that at most one node claims to be leader

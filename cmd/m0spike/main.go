@@ -15,7 +15,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/Samriddha9619/deterministic-cluster-simulator/checkers"
+	"github.com/Samriddha9619/deterministic-cluster-simulator/harness"
 	"github.com/Samriddha9619/deterministic-cluster-simulator/sim"
 	t "github.com/Samriddha9619/deterministic-cluster-simulator/types"
 )
@@ -28,6 +28,7 @@ func main() {
 	withPuts := flag.Int("puts", 50, "number of put operations to submit per seed")
 	withPartition := flag.Bool("partition", true, "inject a network partition mid-run")
 	autoFaults := flag.Int("faults", 0, "number of random upfront faults (crashes, restarts, partitions) to generate")
+	withWorkload := flag.Bool("workload", true, "generate mixed concurrent client workload (Put, Get, Delete, CAS)")
 	flag.Parse()
 
 	passed := 0
@@ -38,7 +39,7 @@ func main() {
 	for i := 0; i < *seedCount; i++ {
 		seed := *startSeed + uint64(i)
 
-		result1 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults)
+		result1 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults, *withWorkload)
 
 		if result1.Violation != "" {
 			failed++
@@ -46,15 +47,9 @@ func main() {
 			continue
 		}
 
-		if v := checkers.CheckConvergence(result1.NodeSnapshots); v != nil {
-			failed++
-			fmt.Printf("FAIL  seed=%d violation=%s\n", seed, v)
-			continue
-		}
-
 		if *detCheck {
 			// Run the same seed again and compare trace hashes.
-			result2 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults)
+			result2 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults, *withWorkload)
 			if result1.TraceHash != result2.TraceHash {
 				detFail++
 				fmt.Printf("DET-FAIL  seed=%d hash1=%s hash2=%s\n",
@@ -94,7 +89,7 @@ func main() {
 }
 
 // runOneSeed creates a simulator, injects workload and faults, and runs it.
-func runOneSeed(seed uint64, numPuts int, withPartition bool, autoFaults int) sim.RunResult {
+func runOneSeed(seed uint64, numPuts int, withPartition bool, autoFaults int, withWorkload bool) sim.RunResult {
 	cfg := sim.DefaultSimConfig(seed)
 	if autoFaults > 0 {
 		cfg.AutoFaults = autoFaults
@@ -111,19 +106,28 @@ func runOneSeed(seed uint64, numPuts int, withPartition bool, autoFaults int) si
 		os.Exit(2)
 	}
 
-	// Schedule put operations spread across the run.
-	// We send them to node 1 initially — if it's not the leader, the node
-	// will reject them and we just see the rejection in the trace.
-	for i := 0; i < numPuts; i++ {
-		// Spread puts from 2s to 20s of virtual time.
-		putTime := 2*t.Second + t.Time(i)*t.Time(18*t.Second/t.Time(numPuts+1))
-		s.EnqueueClientRequest(putTime, t.NodeID(1), t.ClientReq{
-			RequestID: uint64(i + 1),
-			ClientID:  1,
-			Op:        t.OpPut,
-			Key:       fmt.Sprintf("key-%03d", i),
-			Value:     fmt.Sprintf("val-%03d", i),
-		})
+	if withWorkload {
+		wcfg := harness.DefaultWorkloadConfig()
+		wcfg.NumOps = numPuts
+		wcfg.StartTime = 2 * t.Second
+		wcfg.EndTime = 22 * t.Second
+		wRng := sim.NewRand(seed).Fork("workload")
+		nodeIDs := []t.NodeID{t.NodeID(1), t.NodeID(2), t.NodeID(3)}
+		reqs := harness.GenerateWorkload(wRng, nodeIDs, wcfg)
+		for _, r := range reqs {
+			s.EnqueueClientRequest(r.At, r.TargetNode, r.Req)
+		}
+	} else {
+		for i := 0; i < numPuts; i++ {
+			putTime := 2*t.Second + t.Time(i)*t.Time(18*t.Second/t.Time(numPuts+1))
+			s.EnqueueClientRequest(putTime, t.NodeID(1), t.ClientReq{
+				RequestID: uint64(i + 1),
+				ClientID:  1,
+				Op:        t.OpPut,
+				Key:       fmt.Sprintf("key-%03d", i),
+				Value:     fmt.Sprintf("val-%03d", i),
+			})
+		}
 	}
 
 	if autoFaults == 0 {

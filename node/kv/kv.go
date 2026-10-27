@@ -25,6 +25,7 @@ const (
 	CmdPut    CommandType = iota // Put(key, value)
 	CmdDelete                   // Delete(key)
 	CmdCAS                      // CAS(key, old, new)
+	CmdGet                      // Linearizable Get through Raft log
 )
 
 // Command is what gets serialized into a Raft log entry. When the entry is
@@ -67,6 +68,11 @@ type ApplyResult struct {
 // Store — the in-memory key-value state machine
 // ---------------------------------------------------------------------------
 
+type ClientSession struct {
+	LastReqID  uint64      `json:"last_req_id"`
+	LastResult ApplyResult `json:"last_result"`
+}
+
 // Store is a simple in-memory key-value map. It is the state machine that
 // Raft replicates. Every committed entry is applied here via the Apply method.
 //
@@ -76,52 +82,85 @@ type Store struct {
 	// data is the actual key-value map. We use a plain Go map, but when
 	// we need to iterate (for snapshots, comparison), we always sort keys
 	// first to maintain determinism (Go map iteration order is random).
-	data map[string]string
+	data     map[string]string
+	sessions map[uint64]ClientSession
 }
 
 // NewStore creates an empty KV store.
 func NewStore() *Store {
 	return &Store{
-		data: make(map[string]string),
+		data:     make(map[string]string),
+		sessions: make(map[uint64]ClientSession),
 	}
 }
 
 // Apply executes a command against the store and returns the result.
 // This is called for each committed Raft entry, in commit order.
+// If the command is a duplicate (same or older RequestID from the same ClientID),
+// it returns the cached result without re-executing mutations.
 func (s *Store) Apply(cmd Command) ApplyResult {
+	if cmd.ClientID > 0 && cmd.RequestID > 0 {
+		if sess, exists := s.sessions[cmd.ClientID]; exists && sess.LastReqID >= cmd.RequestID {
+			return sess.LastResult
+		}
+	}
+
+	var res ApplyResult
 	switch cmd.Type {
 	case CmdPut:
 		s.data[cmd.Key] = cmd.Value
-		return ApplyResult{OK: true}
+		res = ApplyResult{OK: true}
 
 	case CmdDelete:
 		delete(s.data, cmd.Key)
-		return ApplyResult{OK: true}
+		res = ApplyResult{OK: true}
 
 	case CmdCAS:
 		current, exists := s.data[cmd.Key]
 		if !exists {
-			return ApplyResult{
-				OK:  false,
-				Err: fmt.Sprintf("key %q not found", cmd.Key),
+			if cmd.OldValue == "" {
+				s.data[cmd.Key] = cmd.Value
+				res = ApplyResult{OK: true}
+			} else {
+				res = ApplyResult{
+					OK:  false,
+					Err: fmt.Sprintf("key %q not found", cmd.Key),
+				}
 			}
-		}
-		if current != cmd.OldValue {
-			return ApplyResult{
+		} else if current != cmd.OldValue {
+			res = ApplyResult{
 				OK:    false,
 				Value: current,
 				Err:   fmt.Sprintf("CAS mismatch: expected %q, got %q", cmd.OldValue, current),
 			}
+		} else {
+			s.data[cmd.Key] = cmd.Value
+			res = ApplyResult{OK: true}
 		}
-		s.data[cmd.Key] = cmd.Value
-		return ApplyResult{OK: true}
+
+	case CmdGet:
+		val, exists := s.data[cmd.Key]
+		if exists {
+			res = ApplyResult{OK: true, Value: val}
+		} else {
+			res = ApplyResult{OK: true, Value: ""}
+		}
 
 	default:
-		return ApplyResult{
+		res = ApplyResult{
 			OK:  false,
 			Err: fmt.Sprintf("unknown command type: %d", cmd.Type),
 		}
 	}
+
+	if cmd.ClientID > 0 && cmd.RequestID > 0 {
+		s.sessions[cmd.ClientID] = ClientSession{
+			LastReqID:  cmd.RequestID,
+			LastResult: res,
+		}
+	}
+
+	return res
 }
 
 // Get reads a value from the store. Returns (value, true) if the key exists,
@@ -158,13 +197,21 @@ func (s *Store) Len() int {
 type SnapshotData struct {
 	// Entries is sorted by key for deterministic serialization. We DON'T
 	// use a map here because JSON map serialization order is undefined.
-	Entries []KVEntry `json:"entries"`
+	Entries  []KVEntry      `json:"entries"`
+	Sessions []SessionEntry `json:"sessions,omitempty"`
 }
 
 // KVEntry is a single key-value pair in a snapshot.
 type KVEntry struct {
 	Key   string `json:"k"`
 	Value string `json:"v"`
+}
+
+// SessionEntry stores client session state in a snapshot.
+type SessionEntry struct {
+	ClientID   uint64      `json:"client_id"`
+	LastReqID  uint64      `json:"last_req_id"`
+	LastResult ApplyResult `json:"last_result"`
 }
 
 // Serialize converts the store's state to bytes for a Raft snapshot.
@@ -181,7 +228,24 @@ func (s *Store) Serialize() ([]byte, error) {
 		entries[i] = KVEntry{Key: k, Value: s.data[k]}
 	}
 
-	return json.Marshal(SnapshotData{Entries: entries})
+	// Sort client IDs for deterministic session serialization.
+	clientIDs := make([]uint64, 0, len(s.sessions))
+	for cid := range s.sessions {
+		clientIDs = append(clientIDs, cid)
+	}
+	sort.Slice(clientIDs, func(i, j int) bool { return clientIDs[i] < clientIDs[j] })
+
+	sessions := make([]SessionEntry, len(clientIDs))
+	for i, cid := range clientIDs {
+		sess := s.sessions[cid]
+		sessions[i] = SessionEntry{
+			ClientID:   cid,
+			LastReqID:  sess.LastReqID,
+			LastResult: sess.LastResult,
+		}
+	}
+
+	return json.Marshal(SnapshotData{Entries: entries, Sessions: sessions})
 }
 
 // Restore replaces the store's state with data from a Raft snapshot.
@@ -193,6 +257,13 @@ func (s *Store) Restore(data []byte) error {
 	s.data = make(map[string]string, len(snap.Entries))
 	for _, e := range snap.Entries {
 		s.data[e.Key] = e.Value
+	}
+	s.sessions = make(map[uint64]ClientSession, len(snap.Sessions))
+	for _, sess := range snap.Sessions {
+		s.sessions[sess.ClientID] = ClientSession{
+			LastReqID:  sess.LastReqID,
+			LastResult: sess.LastResult,
+		}
 	}
 	return nil
 }

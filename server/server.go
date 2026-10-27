@@ -70,6 +70,8 @@ type SimulateRequest struct {
 	WithPartition bool    `json:"partition"`
 	NumPuts       int     `json:"puts"`
 	MaxTimeSec    int     `json:"max_time_sec"`
+	Faults        int     `json:"faults"`
+	Workload      bool    `json:"workload"`
 }
 
 func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
@@ -89,6 +91,8 @@ func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
 		WithPartition: true,
 		NumPuts:       40,
 		MaxTimeSec:    25,
+		Faults:        0,
+		Workload:      true,
 	}
 
 	if r.Method == http.MethodPost {
@@ -113,6 +117,14 @@ func (s *Server) handleSimulate(w http.ResponseWriter, r *http.Request) {
 				req.NumPuts = v
 			}
 		}
+		if fVal := q.Get("faults"); fVal != "" {
+			if v, err := strconv.Atoi(fVal); err == nil {
+				req.Faults = v
+			}
+		}
+		if wVal := q.Get("workload"); wVal != "" {
+			req.Workload = (wVal == "true" || wVal == "1")
+		}
 	}
 
 	trace := runSimulationTrace(req)
@@ -131,6 +143,8 @@ type SweepRequest struct {
 	DropRate  float64 `json:"drop_rate"`
 	Partition bool    `json:"partition"`
 	NumPuts   int     `json:"puts"`
+	Faults    int     `json:"faults"`
+	Workload  bool    `json:"workload"`
 }
 
 // SweepItem records the result of one seed in the sweep.
@@ -198,6 +212,8 @@ func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 			WithPartition: req.Partition,
 			NumPuts:       req.NumPuts,
 			MaxTimeSec:    25,
+			Faults:        req.Faults,
+			Workload:      req.Workload,
 		}
 		res := runSimulationTrace(simReq)
 		item := SweepItem{
@@ -235,6 +251,10 @@ func runSimulationTrace(req SimulateRequest) *harness.RunTrace {
 	linkCfg.DropRate = req.DropRate
 	cfg.LinkConfig = &linkCfg
 
+	if req.Faults > 0 {
+		cfg.AutoFaults = req.Faults
+	}
+
 	s, err := sim.NewSimulator(cfg)
 	if err != nil {
 		return &harness.RunTrace{
@@ -248,8 +268,24 @@ func runSimulationTrace(req SimulateRequest) *harness.RunTrace {
 		}
 	}
 
-	// Schedule puts across the run
-	if req.NumPuts > 0 {
+	// Schedule operations across the run
+	if req.Workload {
+		wcfg := harness.DefaultWorkloadConfig()
+		if req.NumPuts > 0 {
+			wcfg.NumOps = req.NumPuts
+		}
+		wcfg.StartTime = 2 * t.Second
+		wcfg.EndTime = 22 * t.Second
+		wRng := sim.NewRand(req.Seed).Fork("workload")
+		var nodeIDs []t.NodeID
+		for i := 1; i <= cfg.NumNodes; i++ {
+			nodeIDs = append(nodeIDs, t.NodeID(i))
+		}
+		workloadReqs := harness.GenerateWorkload(wRng, nodeIDs, wcfg)
+		for _, r := range workloadReqs {
+			s.EnqueueClientRequest(r.At, r.TargetNode, r.Req)
+		}
+	} else if req.NumPuts > 0 {
 		for i := 0; i < req.NumPuts; i++ {
 			putTime := 2*t.Second + t.Time(i)*t.Time(16*t.Second/t.Time(req.NumPuts+1))
 			s.EnqueueClientRequest(putTime, t.NodeID(1), t.ClientReq{
@@ -262,7 +298,7 @@ func runSimulationTrace(req SimulateRequest) *harness.RunTrace {
 		}
 	}
 
-	if req.WithPartition && req.NumNodes >= 3 {
+	if cfg.AutoFaults == 0 && req.WithPartition && req.NumNodes >= 3 {
 		s.EnqueuePartition(7*t.Second, [][]t.NodeID{
 			{t.NodeID(1), t.NodeID(2)},
 			{t.NodeID(3)},

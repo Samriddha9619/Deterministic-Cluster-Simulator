@@ -8,14 +8,7 @@ import (
 )
 
 // Violation describes a safety or invariant failure found by a checker.
-type Violation struct {
-	Checker string `json:"checker"`
-	Detail  string `json:"detail"`
-}
-
-func (v Violation) String() string {
-	return fmt.Sprintf("[%s] %s", v.Checker, v.Detail)
-}
+type Violation = t.Violation
 
 // CheckOneLeaderPerTerm verifies that at most one node is leader for any given term.
 func CheckOneLeaderPerTerm(snapshots []t.NodeView) *Violation {

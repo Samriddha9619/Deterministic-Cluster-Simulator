@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 
-	"github.com/Samriddha9619/deterministic-cluster-simulator/checkers"
 	t "github.com/Samriddha9619/deterministic-cluster-simulator/types"
 )
 
@@ -37,9 +36,9 @@ type TraceEvent struct {
 
 // TraceVerdict represents the final evaluation of checkers on the run.
 type TraceVerdict struct {
-	Passed              bool                `json:"passed"`
-	Violation           *checkers.Violation `json:"violation,omitempty"`
-	ViolationEventIndex int                 `json:"violation_event_index,omitempty"`
+	Passed              bool         `json:"passed"`
+	Violation           *t.Violation `json:"violation,omitempty"`
+	ViolationEventIndex int          `json:"violation_event_index,omitempty"`
 }
 
 // RunTrace is the complete recording of a run, serialized for the web UI.

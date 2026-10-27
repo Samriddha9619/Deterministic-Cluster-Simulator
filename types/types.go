@@ -234,6 +234,12 @@ func (r RaftRole) String() string {
 	}
 }
 
+// LogEntrySummary summarizes a Raft log entry for inspection and log safety invariants.
+type LogEntrySummary struct {
+	Index uint64 `json:"index"`
+	Term  uint64 `json:"term"`
+}
+
 // NodeView is a read-only snapshot of a node's state, used by the UI and checkers.
 type NodeView struct {
 	ID           NodeID
@@ -244,8 +250,19 @@ type NodeView struct {
 	CommitIndex  uint64
 	AppliedIndex uint64
 	LogLength    uint64
+	LogEntries   []LogEntrySummary
 	KVState      map[string]string
 	Alive        bool
+}
+
+// Violation describes a safety or invariant failure found by a checker.
+type Violation struct {
+	Checker string `json:"checker"`
+	Detail  string `json:"detail"`
+}
+
+func (v Violation) String() string {
+	return fmt.Sprintf("[%s] %s", v.Checker, v.Detail)
 }
 
 // ---------------------------------------------------------------------------
