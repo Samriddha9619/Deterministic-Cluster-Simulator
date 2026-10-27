@@ -1,5 +1,7 @@
-project_task.md
 /m0spike
+project_task.md
 /simnode
 /bin/
 *.test
+web/node_modules/
+web/dist/

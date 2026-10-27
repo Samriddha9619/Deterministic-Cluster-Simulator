@@ -27,6 +27,7 @@ func main() {
 	verbose := flag.Bool("v", false, "verbose output (print per-seed results)")
 	withPuts := flag.Int("puts", 50, "number of put operations to submit per seed")
 	withPartition := flag.Bool("partition", true, "inject a network partition mid-run")
+	autoFaults := flag.Int("faults", 0, "number of random upfront faults (crashes, restarts, partitions) to generate")
 	flag.Parse()
 
 	passed := 0
@@ -37,7 +38,7 @@ func main() {
 	for i := 0; i < *seedCount; i++ {
 		seed := *startSeed + uint64(i)
 
-		result1 := runOneSeed(seed, *withPuts, *withPartition)
+		result1 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults)
 
 		if result1.Violation != "" {
 			failed++
@@ -53,7 +54,7 @@ func main() {
 
 		if *detCheck {
 			// Run the same seed again and compare trace hashes.
-			result2 := runOneSeed(seed, *withPuts, *withPartition)
+			result2 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults)
 			if result1.TraceHash != result2.TraceHash {
 				detFail++
 				fmt.Printf("DET-FAIL  seed=%d hash1=%s hash2=%s\n",
@@ -93,8 +94,11 @@ func main() {
 }
 
 // runOneSeed creates a simulator, injects workload and faults, and runs it.
-func runOneSeed(seed uint64, numPuts int, withPartition bool) sim.RunResult {
+func runOneSeed(seed uint64, numPuts int, withPartition bool, autoFaults int) sim.RunResult {
 	cfg := sim.DefaultSimConfig(seed)
+	if autoFaults > 0 {
+		cfg.AutoFaults = autoFaults
+	}
 
 	// Add some drops to make things interesting.
 	linkCfg := sim.DefaultLinkConfig()
@@ -122,13 +126,19 @@ func runOneSeed(seed uint64, numPuts int, withPartition bool) sim.RunResult {
 		})
 	}
 
-	if withPartition {
-		// Partition node 3 away from nodes 1,2 at 8s, heal at 15s.
-		s.EnqueuePartition(8*t.Second, [][]t.NodeID{
-			{t.NodeID(1), t.NodeID(2)},
-			{t.NodeID(3)},
-		})
-		s.EnqueueHeal(15 * t.Second)
+	if autoFaults == 0 {
+		if withPartition {
+			// Partition node 3 away from nodes 1,2 at 8s, heal at 15s.
+			s.EnqueuePartition(8*t.Second, [][]t.NodeID{
+				{t.NodeID(1), t.NodeID(2)},
+				{t.NodeID(3)},
+			})
+			s.EnqueueHeal(15 * t.Second)
+		}
+
+		// Crash node 2 at 5s, restart from durable state at 10s.
+		s.EnqueueCrash(5*t.Second, t.NodeID(2))
+		s.EnqueueRestart(10*t.Second, t.NodeID(2))
 	}
 
 	return s.Run()

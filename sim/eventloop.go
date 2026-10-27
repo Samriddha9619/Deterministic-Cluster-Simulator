@@ -42,6 +42,14 @@ type SimConfig struct {
 
 	// DiskConfig overrides default disk settings (optional).
 	DiskCfg *DiskConfig
+
+	// Faults is an explicit fault plan to execute. If nil, faults are
+	// either generated via AutoFaults or enqueued manually.
+	Faults *FaultPlan
+
+	// AutoFaults, if > 0, generates a random fault plan up front from
+	// the dedicated "faults" RNG stream.
+	AutoFaults int
 }
 
 // DefaultSimConfig returns a reasonable config for M0 testing.
@@ -101,6 +109,9 @@ type Simulator struct {
 
 	// invariantViolation is set if an invariant check fails during the run.
 	invariantViolation string
+
+	// faultPlan is the active schedule of faults.
+	faultPlan *FaultPlan
 }
 
 // NewSimulator creates and initializes a simulator from the given config.
@@ -160,6 +171,13 @@ func NewSimulator(cfg SimConfig) (*Simulator, error) {
 		nodes[id] = node
 	}
 
+	// Generate upfront fault plan if AutoFaults > 0 and no plan specified.
+	faultPlan := cfg.Faults
+	if faultPlan == nil && cfg.AutoFaults > 0 {
+		faultRng := masterRand.Fork("faults")
+		faultPlan = GenerateRandomFaultPlan(faultRng, nodeIDs, cfg.MaxTime, cfg.AutoFaults)
+	}
+
 	sim := &Simulator{
 		config:     cfg,
 		queue:      NewEventQueue(),
@@ -169,6 +187,12 @@ func NewSimulator(cfg SimConfig) (*Simulator, error) {
 		nodeIDs:    nodeIDs,
 		masterRand: masterRand,
 		trace:      make([]TraceEvent, 0, cfg.MaxEvents),
+		faultPlan:  faultPlan,
+	}
+
+	// Schedule the fault plan if present.
+	if faultPlan != nil {
+		faultPlan.ScheduleOn(sim)
 	}
 
 	// Schedule the initial tick for each node. Using sorted nodeIDs
@@ -198,6 +222,7 @@ type RunResult struct {
 	TraceHash     string       `json:"trace_hash"`
 	NodeSnapshots []t.NodeView `json:"node_snapshots"`
 	Trace         []TraceEvent `json:"trace,omitempty"`
+	FaultPlan     *FaultPlan   `json:"fault_plan,omitempty"`
 }
 
 // Run executes the simulation until a stopping condition is met:
@@ -283,6 +308,7 @@ func (s *Simulator) Run() RunResult {
 		TraceHash:     hashStr,
 		NodeSnapshots: snapshots,
 		Trace:         s.trace,
+		FaultPlan:     s.faultPlan,
 	}
 }
 
@@ -309,6 +335,10 @@ func (s *Simulator) dispatch(evt *Event) {
 		s.handlePartition(evt)
 	case EventHeal:
 		s.handleHeal(evt)
+	case EventLinkCut:
+		s.handleLinkCut(evt)
+	case EventLinkRestore:
+		s.handleLinkRestore(evt)
 	}
 }
 
@@ -429,6 +459,16 @@ func (s *Simulator) handleHeal(evt *Event) {
 	s.network.Heal()
 }
 
+// handleLinkCut cuts a single directed link.
+func (s *Simulator) handleLinkCut(evt *Event) {
+	s.network.CutLink(evt.LinkFrom, evt.LinkTo)
+}
+
+// handleLinkRestore restores a single directed link.
+func (s *Simulator) handleLinkRestore(evt *Event) {
+	s.network.RestoreLink(evt.LinkFrom, evt.LinkTo)
+}
+
 // ---------------------------------------------------------------------------
 // Output processing
 // ---------------------------------------------------------------------------
@@ -487,6 +527,15 @@ func (s *Simulator) processOutput(nodeID t.NodeID, output t.Output) {
 				Target:  msgCopy.To,
 				Message: &msgCopy,
 			})
+			if result.Duplicate {
+				dupeCopy := CopyEnvelope(msgCopy)
+				s.queue.Enqueue(&Event{
+					At:      result.DuplicateAt,
+					Kind:    EventDeliver,
+					Target:  dupeCopy.To,
+					Message: &dupeCopy,
+				})
+			}
 		}
 		// If not delivered, the message is silently dropped (logged in trace).
 	}

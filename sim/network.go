@@ -11,17 +11,21 @@ import (
 // LinkConfig describes the simulated behavior of a single directed network
 // link (from → to).
 type LinkConfig struct {
-	MinLatency t.Time
-	MaxLatency t.Time
-	DropRate   float64 // probability [0.0, 1.0] of silent message drop
+	MinLatency    t.Time
+	MaxLatency    t.Time
+	DropRate      float64 // probability [0.0, 1.0] of silent message drop
+	DuplicateRate float64 // probability [0.0, 1.0] of delivering a duplicate message
+	Disabled      bool    // whether directed link is completely cut
 }
 
 // DefaultLinkConfig returns a reasonable default: 1-10ms latency, no drops.
 func DefaultLinkConfig() LinkConfig {
 	return LinkConfig{
-		MinLatency: 1 * t.Millisecond,
-		MaxLatency: 10 * t.Millisecond,
-		DropRate:   0.0,
+		MinLatency:    1 * t.Millisecond,
+		MaxLatency:    10 * t.Millisecond,
+		DropRate:      0.0,
+		DuplicateRate: 0.0,
+		Disabled:      false,
 	}
 }
 
@@ -70,6 +74,20 @@ func (n *Network) GetLinkConfig(from, to t.NodeID) LinkConfig {
 		return cfg
 	}
 	return DefaultLinkConfig()
+}
+
+// CutLink disables traffic over a single directed link (from -> to).
+func (n *Network) CutLink(from, to t.NodeID) {
+	cfg := n.GetLinkConfig(from, to)
+	cfg.Disabled = true
+	n.links[linkKey{from, to}] = cfg
+}
+
+// RestoreLink restores traffic over a single directed link (from -> to).
+func (n *Network) RestoreLink(from, to t.NodeID) {
+	cfg := n.GetLinkConfig(from, to)
+	cfg.Disabled = false
+	n.links[linkKey{from, to}] = cfg
 }
 
 // SetPartition installs a network partition. Nodes in different groups
@@ -128,9 +146,11 @@ func (n *Network) IsAlive(id t.NodeID) bool {
 
 // SendResult describes what happened when a message was sent.
 type SendResult struct {
-	Delivered  bool
-	DeliverAt  t.Time
-	DropReason string
+	Delivered   bool
+	DeliverAt   t.Time
+	Duplicate   bool
+	DuplicateAt t.Time
+	DropReason  string
 }
 
 // Send decides whether/when to deliver a message. It does NOT enqueue the
@@ -146,14 +166,22 @@ func (n *Network) Send(now t.Time, env t.Envelope) SendResult {
 		return SendResult{Delivered: false, DropReason: "partitioned"}
 	}
 	cfg := n.GetLinkConfig(env.From, env.To)
+	if cfg.Disabled {
+		return SendResult{Delivered: false, DropReason: "link cut"}
+	}
 	if cfg.DropRate > 0 && BoolWithProb(n.rng, cfg.DropRate) {
 		return SendResult{Delivered: false, DropReason: "random drop"}
 	}
 	latency := DurationBetween(n.rng, cfg.MinLatency, cfg.MaxLatency)
-	return SendResult{
+	res := SendResult{
 		Delivered: true,
 		DeliverAt: now + latency,
 	}
+	if cfg.DuplicateRate > 0 && BoolWithProb(n.rng, cfg.DuplicateRate) {
+		res.Duplicate = true
+		res.DuplicateAt = now + latency + DurationBetween(n.rng, 1*t.Millisecond, 5*t.Millisecond)
+	}
+	return res
 }
 
 // CopyEnvelope creates a deep copy of an envelope so nodes never share memory.

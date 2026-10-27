@@ -23,6 +23,8 @@ const (
 	EventCrash                      // kill a node
 	EventPartition                  // install a network partition
 	EventHeal                       // remove a network partition
+	EventLinkCut                    // isolate single directed link
+	EventLinkRestore                // restore single directed link
 	EventEnd                        // end of simulation
 )
 
@@ -30,7 +32,7 @@ const (
 func (k EventKind) String() string {
 	names := [...]string{
 		"tick", "deliver", "client-req", "disk-done", "restart",
-		"crash", "partition", "heal", "end",
+		"crash", "partition", "heal", "link-cut", "link-restore", "end",
 	}
 	if int(k) < len(names) {
 		return names[k]
@@ -56,6 +58,8 @@ type Event struct {
 	DiskResult *t.DiskOpResult
 	DiskImage  *t.DiskImage
 	Partition  [][]t.NodeID
+	LinkFrom   t.NodeID
+	LinkTo     t.NodeID
 
 	// index is the heap position, managed by container/heap.
 	index int

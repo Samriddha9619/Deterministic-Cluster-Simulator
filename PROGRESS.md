@@ -6,8 +6,8 @@
 |---|---|---|---|
 | **M0** | Feasibility Spike | **DONE** | 3-node etcd/raft cluster, seeded event loop, network drops & partition, leader-per-term & convergence checks, patched library randomness. |
 | **M1** | Skeleton & First Visual | **DONE** | Trace JSON emitter, Go HTTP server, interactive cluster canvas with timeline scrubber & node inspector. |
-| **M2** | Faults & Disk Subsystem | **NEXT** | Network fault model (asymmetry, delays), crash/restart, volatile vs durable disk buffer with sync, fault plan. |
-| **M3** | Replicated KV & Complete Checkers | Pending | Production Ready ordering, KV state machine, snapshotting & log compaction, client workload generator, history recorder, 6 checkers. |
+| **M2** | Faults & Disk Subsystem | **DONE** | Network fault model (asymmetry, delays), crash/restart, volatile vs durable disk buffer with sync, upfront FaultPlan, BUGGIFY macro. |
+| **M3** | Replicated KV & Complete Checkers | **NEXT** | Production Ready ordering, KV state machine, snapshotting & log compaction, client workload generator, history recorder, 6 checkers. |
 | **M4** | Sweep & Shrink Engine | Pending | Parallel seed sweep runner, violation freeze, delta-debugging schedule shrinker. |
 | **M5** | Bug Gallery | Pending | 6 planted bugs behind flags (ack before fsync, wrong quorum, stale term, unpersisted vote, early apply, stale read) + benchmarks. |
 | **M6** | Real Runtime (`/runtime/real`) | Pending | `simnode` binary, real TCP framing, append-only WAL with `fsync`, process manager (SIGKILL, SIGSTOP, restart). |
@@ -31,9 +31,15 @@
 
 - [x] **Trace JSON Emitter**: Implemented `harness/trace.go` with full metadata, per-event post-dispatch cluster snapshots, and verdicts.
 - [x] **Web & Simulation Server**: Implemented `server/server.go` and `cmd/server/main.go` serving static assets and REST endpoints (`/api/simulate`, `/api/sweep`, `/api/health`).
-- [x] **Frontend Cluster Visualizer**: Implemented `web/index.html`, `web/styles.css`, and `web/app.js` featuring:
-  - Cluster canvas topology with live roles, pulse glows, and message packet animations.
-  - Zero-latency timeline scrubber with play/pause, step backward/forward, and speed controls.
-  - Interactive Node Inspector displaying term, vote, commit index, applied index, and live KV state.
-  - Multi-seed sweep drawer (24 seeds in ~770ms) with direct seed inspection.
+- [x] **Frontend Cluster Visualizer**: Implemented `web/index.html`, `web/styles.css`, and `web/app.js` featuring canvas topology, instant timeline scrubber, node inspector, and seed sweep drawer.
 - [x] **End-to-End Browser Validation**: Tested and verified in browser subagent with WebP session recording saved.
+
+---
+
+## M2 Details & Verification
+
+- [x] **Fault Plan & Shrinking Foundation**: Implemented `sim/faults.go` with `FaultKind`, `FaultAction`, `FaultPlan` (ordered, cloneable, serializable, with `WithoutAction` for M4 delta-debugging).
+- [x] **Buggify Macro**: Implemented `sim/buggify.go` following FoundationDB `BUGGIFY` pattern with stable site names and activation recorder.
+- [x] **Network Faults**: Added asymmetric link cuts/restores (`sim/network.go`, `sim/event.go`), delay bounds, drop rates, and packet duplication modeling.
+- [x] **Disk Subsystem & Crash-Recovery**: Built crash recovery with volatile vs durable disk state in `node/raftnode/adapter.go`. On restart, completely wipes volatile RAM, reconstructs `RawNode` strictly from durable disk storage image, verifies HardState and WAL persistence.
+- [x] **Determinism Verification under Chaos**: Tested 50 seeds with multi-fault plans (crashes, restarts, partitions, drops); 50/50 passed with 100% identical double-run trace SHA-256 hashes (`Det-Fail: 0`).

@@ -46,7 +46,17 @@ import (
 //   3. The event loop processes the Output (disk writes, message sends).
 //   4. When disk completes, the event loop calls OnDiskDone, which triggers
 //      message sending and entry application.
+// DurableState is the persistent state that survives crashes.
+type DurableState struct {
+	HardState *pb.HardState     `json:"hard_state,omitempty"`
+	Entries   []pb.Entry        `json:"entries,omitempty"`
+	Snapshot  *pb.Snapshot      `json:"snapshot,omitempty"`
+	Applied   uint64            `json:"applied"`
+	KVState   map[string]string `json:"kv_state,omitempty"`
+}
+
 type RaftNode struct {
+	cfg          Config
 	id           t.NodeID
 	raw          *raft.RawNode
 	storage      *raft.MemoryStorage
@@ -56,6 +66,7 @@ type RaftNode struct {
 
 	// appliedIndex tracks which entries we've applied to the KV store.
 	appliedIndex uint64
+	durableState DurableState
 
 	// pendingReady holds the Ready that is waiting for disk confirmation.
 	// It is set when we get a Ready with MustSync=true, and cleared when
@@ -139,6 +150,7 @@ func NewRaftNode(cfg Config) (*RaftNode, error) {
 	}
 
 	return &RaftNode{
+		cfg:              cfg,
 		id:               cfg.ID,
 		raw:              raw,
 		storage:          storage,
@@ -316,6 +328,64 @@ func (n *RaftNode) OnDiskDone(now t.Time, result t.DiskOpResult) t.Output {
 // OnRestart is called after a crash to reinitialize the node from durable state.
 func (n *RaftNode) OnRestart(now t.Time, durable t.DiskImage) t.Output {
 	n.alive = true
+	n.pendingReady = nil
+	n.pendingProposals = make(map[uint64]t.ClientReq)
+
+	if len(durable.Data) == 0 {
+		return n.drainReady(now)
+	}
+
+	var state DurableState
+	if err := json.Unmarshal(durable.Data, &state); err != nil {
+		return n.drainReady(now)
+	}
+	n.durableState = state
+
+	storage := raft.NewMemoryStorage()
+	if state.Snapshot != nil && !raft.IsEmptySnap(state.Snapshot) {
+		_ = storage.ApplySnapshot(state.Snapshot)
+	}
+	if len(state.Entries) > 0 {
+		ents := make([]*pb.Entry, len(state.Entries))
+		for i := range state.Entries {
+			eCopy := state.Entries[i]
+			ents[i] = &eCopy
+		}
+		_ = storage.Append(ents)
+	}
+	if state.HardState != nil {
+		_ = storage.SetHardState(state.HardState)
+	}
+
+	n.kv = kv.NewStore()
+	if state.KVState != nil {
+		for k, v := range state.KVState {
+			n.kv.Apply(kv.Command{
+				Type:  kv.CmdPut,
+				Key:   k,
+				Value: v,
+			})
+		}
+	}
+	n.appliedIndex = state.Applied
+
+	raftCfg := &raft.Config{
+		ID:              uint64(n.cfg.ID),
+		ElectionTick:    n.cfg.ElectionTick,
+		HeartbeatTick:   n.cfg.HeartbeatTick,
+		Storage:         storage,
+		MaxSizePerMsg:   1024 * 1024,
+		MaxInflightMsgs: 256,
+		Logger:          discardLogger{},
+		Rand:            n.cfg.Rand,
+	}
+	raw, err := raft.NewRawNode(raftCfg)
+	if err != nil {
+		panic(fmt.Sprintf("raftnode: recreate raw node on restart: %v", err))
+	}
+	n.raw = raw
+	n.storage = storage
+
 	return n.drainReady(now)
 }
 
@@ -460,20 +530,31 @@ func (n *RaftNode) applyEntry(entry *pb.Entry) []t.ClientResp {
 // serializeForDisk creates a serialized representation of data that needs
 // to be persisted.
 func (n *RaftNode) serializeForDisk(rd raft.Ready) []byte {
-	// For M0, a simple JSON blob. Later milestones will use a proper WAL format.
-	type diskPayload struct {
-		HasHardState bool   `json:"has_hs"`
-		HardState    []byte `json:"hs,omitempty"`
-		NumEntries   int    `json:"num_entries"`
-	}
-	payload := diskPayload{
-		HasHardState: rd.HardState != nil,
-		NumEntries:   len(rd.Entries),
-	}
 	if rd.HardState != nil {
-		payload.HardState, _ = proto.Marshal(rd.HardState)
+		hsCopy := *rd.HardState
+		n.durableState.HardState = &hsCopy
 	}
-	data, _ := json.Marshal(payload)
+	if len(rd.Entries) > 0 {
+		firstNew := rd.Entries[0].GetIndex()
+		var updated []pb.Entry
+		for _, e := range n.durableState.Entries {
+			if e.GetIndex() < firstNew {
+				updated = append(updated, e)
+			}
+		}
+		for _, e := range rd.Entries {
+			updated = append(updated, *e)
+		}
+		n.durableState.Entries = updated
+	}
+	if rd.Snapshot != nil && !raft.IsEmptySnap(rd.Snapshot) {
+		snapCopy := *rd.Snapshot
+		n.durableState.Snapshot = &snapCopy
+	}
+	n.durableState.Applied = n.appliedIndex
+	n.durableState.KVState = n.kv.Clone()
+
+	data, _ := json.Marshal(n.durableState)
 	return data
 }
 
