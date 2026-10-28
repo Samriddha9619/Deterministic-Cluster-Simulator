@@ -25,11 +25,28 @@ func main() {
 	startSeed := flag.Uint64("start", 1, "starting seed value")
 	detCheck := flag.Bool("det", false, "determinism check: run each seed twice and compare trace hashes")
 	verbose := flag.Bool("v", false, "verbose output (print per-seed results)")
-	withPuts := flag.Int("puts", 50, "number of put operations to submit per seed")
+	withPuts := flag.Int("puts", 50, "number of operations to submit per seed")
 	withPartition := flag.Bool("partition", true, "inject a network partition mid-run")
 	autoFaults := flag.Int("faults", 0, "number of random upfront faults (crashes, restarts, partitions) to generate")
 	withWorkload := flag.Bool("workload", true, "generate mixed concurrent client workload (Put, Get, Delete, CAS)")
+	shrinkSeed := flag.Uint64("shrink", 0, "seed to shrink: runs delta-debugging to minimize faults and workload")
+	bugFlag := flag.String("bug", "", "planted bug to activate (e.g. ack_fsync, early_apply, unpersisted_vote)")
+	parallel := flag.Int("parallel", 0, "parallel worker count (0 = serial loop, >0 = parallel sweep)")
 	flag.Parse()
+
+	bugs := parseBugFlags(*bugFlag)
+
+	// If shrink mode is requested, run delta-debugging shrinker on that seed.
+	if *shrinkSeed > 0 {
+		runShrinkerOnSeed(*shrinkSeed, *autoFaults, *withWorkload, *withPuts, bugs)
+		return
+	}
+
+	// If parallel sweep is requested with > 1 seed
+	if *parallel > 0 && *seedCount > 1 {
+		runParallelSweep(*startSeed, *seedCount, *parallel, *autoFaults, *withWorkload, *withPuts, *detCheck, bugs)
+		return
+	}
 
 	passed := 0
 	failed := 0
@@ -39,7 +56,7 @@ func main() {
 	for i := 0; i < *seedCount; i++ {
 		seed := *startSeed + uint64(i)
 
-		result1 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults, *withWorkload)
+		result1 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults, *withWorkload, bugs)
 
 		if result1.Violation != "" {
 			failed++
@@ -48,8 +65,7 @@ func main() {
 		}
 
 		if *detCheck {
-			// Run the same seed again and compare trace hashes.
-			result2 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults, *withWorkload)
+			result2 := runOneSeed(seed, *withPuts, *withPartition, *autoFaults, *withWorkload, bugs)
 			if result1.TraceHash != result2.TraceHash {
 				detFail++
 				fmt.Printf("DET-FAIL  seed=%d hash1=%s hash2=%s\n",
@@ -88,9 +104,112 @@ func main() {
 	}
 }
 
+func parseBugFlags(name string) t.BugFlags {
+	var b t.BugFlags
+	switch name {
+	case "ack_fsync", "ack_before_fsync":
+		b.AckBeforeFsync = true
+	case "early_apply":
+		b.EarlyApply = true
+	case "unpersisted_vote":
+		b.UnpersistedVote = true
+	}
+	return b
+}
+
+func runShrinkerOnSeed(seed uint64, faults int, workload bool, numOps int, bugs t.BugFlags) {
+	fmt.Printf("▶ Running delta-debugging shrinker on seed %d...\n", seed)
+	nodeIDs := []t.NodeID{1, 2, 3}
+
+	var plan *sim.FaultPlan
+	if faults > 0 {
+		faultRng := sim.NewRand(seed).Fork("faults")
+		plan = sim.GenerateRandomFaultPlan(faultRng, nodeIDs, 25*t.Second, faults)
+	} else {
+		plan = sim.NewFaultPlan()
+	}
+
+	var ops []harness.ScheduledClientReq
+	if workload {
+		wcfg := harness.DefaultWorkloadConfig()
+		wcfg.NumOps = numOps
+		wcfg.StartTime = 2 * t.Second
+		wcfg.EndTime = 22 * t.Second
+		wRng := sim.NewRand(seed).Fork("workload")
+		ops = harness.GenerateWorkload(wRng, nodeIDs, wcfg)
+	}
+
+	shrinker := sim.NewShrinker(sim.ShrinkInput{
+		Seed:       seed,
+		NumNodes:   3,
+		MaxTimeSec: 25,
+		FaultPlan:  plan,
+		Workload:   ops,
+		Bugs:       bugs,
+	})
+
+	res, err := shrinker.Shrink()
+	if err != nil {
+		fmt.Printf("Shrinking aborted: %v\n", err)
+		return
+	}
+
+	fmt.Println("═══════════════════════════════════════")
+	fmt.Printf("  Shrunk Seed: %d\n", seed)
+	fmt.Printf("  Initial Violation: %s\n", res.InitialViolation)
+	fmt.Printf("  Final Violation:   %s\n", res.FinalViolation)
+	fmt.Printf("  Faults: %d → %d actions\n", res.OriginalFaults, res.ShrunkFaults)
+	fmt.Printf("  Client Ops: %d → %d ops\n", res.OriginalOps, res.ShrunkOps)
+	fmt.Printf("  Iterations: %d\n", res.Iterations)
+	fmt.Printf("  Summary: %s\n", res.Summary)
+	fmt.Println("───────────────────────────────────────")
+	fmt.Println("  Minimal Fault Actions:")
+	for i, a := range res.ShrunkPlan.Actions {
+		fmt.Printf("    [%d] %s\n", i, a)
+	}
+	fmt.Println("═══════════════════════════════════════")
+}
+
+func runParallelSweep(start uint64, count int, workers int, faults int, workload bool, puts int, det bool, bugs t.BugFlags) {
+	fmt.Printf("▶ Sweeping %d seeds using %d parallel workers...\n", count, workers)
+	report := sim.RunSweep(sim.SweepConfig{
+		StartSeed:        start,
+		Count:            count,
+		Concurrency:      workers,
+		NumNodes:         3,
+		DropRate:         0.05,
+		Faults:           faults,
+		Workload:         workload,
+		NumOps:           puts,
+		CheckDeterminism: det,
+		MaxTimeSec:       25,
+		Bugs:             bugs,
+	})
+
+	for _, f := range report.Failures {
+		fmt.Printf("FAIL  seed=%d violation=%s\n", f.Seed, f.Violation)
+	}
+
+	fmt.Println()
+	fmt.Println("═══════════════════════════════════════")
+	fmt.Printf("  Seeds: %d  Passed: %d  Failed: %d", report.Total, report.Passed, report.Failed)
+	if det {
+		fmt.Printf("  Det-Fail: %d", report.DetFailed)
+	}
+	fmt.Println()
+	fmt.Printf("  Wall time: %s (%.0f seeds/sec)\n",
+		report.WallDuration.Round(time.Millisecond), report.SeedsPerSec)
+	fmt.Println("═══════════════════════════════════════")
+
+	if report.Failed > 0 || report.DetFailed > 0 {
+		os.Exit(1)
+	}
+}
+
 // runOneSeed creates a simulator, injects workload and faults, and runs it.
-func runOneSeed(seed uint64, numPuts int, withPartition bool, autoFaults int, withWorkload bool) sim.RunResult {
+func runOneSeed(seed uint64, numPuts int, withPartition bool, autoFaults int, withWorkload bool, bugs t.BugFlags) sim.RunResult {
 	cfg := sim.DefaultSimConfig(seed)
+	cfg.Bugs = bugs
 	if autoFaults > 0 {
 		cfg.AutoFaults = autoFaults
 	}

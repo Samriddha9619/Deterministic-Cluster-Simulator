@@ -312,3 +312,47 @@ type Rand interface {
 type Clock interface {
 	Now() Time
 }
+
+// ---------------------------------------------------------------------------
+// BugFlags — planted bugs for checker and shrinker verification
+// ---------------------------------------------------------------------------
+
+// BugFlags defines planted bug flags for fault injection and checker verification.
+type BugFlags struct {
+	AckBeforeFsync    bool `json:"ack_before_fsync,omitempty"`    // Acknowledge proposal or commit before disk sync
+	WrongQuorum       bool `json:"wrong_quorum,omitempty"`        // Accept minority as quorum
+	StaleTermAccepted bool `json:"stale_term_accepted,omitempty"` // Do not reject lower-term messages
+	UnpersistedVote   bool `json:"unpersisted_vote,omitempty"`    // Forget votedFor across restart
+	EarlyApply        bool `json:"early_apply,omitempty"`         // Apply entries ahead of commit index
+	StaleRead         bool `json:"stale_read,omitempty"`          // Serve read from deposed leader without consensus
+}
+
+// ActiveNames returns the list of names of enabled bugs.
+func (b BugFlags) ActiveNames() []string {
+	var names []string
+	if b.AckBeforeFsync {
+		names = append(names, "ack_before_fsync")
+	}
+	if b.WrongQuorum {
+		names = append(names, "wrong_quorum")
+	}
+	if b.StaleTermAccepted {
+		names = append(names, "stale_term_accepted")
+	}
+	if b.UnpersistedVote {
+		names = append(names, "unpersisted_vote")
+	}
+	if b.EarlyApply {
+		names = append(names, "early_apply")
+	}
+	if b.StaleRead {
+		names = append(names, "stale_read")
+	}
+	return names
+}
+
+// AnyActive returns true if at least one bug flag is enabled.
+func (b BugFlags) AnyActive() bool {
+	return b.AckBeforeFsync || b.WrongQuorum || b.StaleTermAccepted ||
+		b.UnpersistedVote || b.EarlyApply || b.StaleRead
+}

@@ -8,8 +8,8 @@
 | **M1** | Skeleton & First Visual | **DONE** | Trace JSON emitter, Go HTTP server, interactive cluster canvas with timeline scrubber & node inspector. |
 | **M2** | Faults & Disk Subsystem | **DONE** | Network fault model (asymmetry, delays), crash/restart, volatile vs durable disk buffer with sync, upfront FaultPlan, BUGGIFY macro. |
 | **M3** | Replicated KV & Complete Checkers | **DONE** | Production Ready ordering, KV state machine, snapshotting & log compaction, client workload generator, history recorder, 6 checkers. |
-| **M4** | Sweep & Shrink Engine | **NEXT** | Parallel seed sweep runner, violation freeze, delta-debugging schedule shrinker. |
-| **M5** | Bug Gallery | Pending | 6 planted bugs behind flags (ack before fsync, wrong quorum, stale term, unpersisted vote, early apply, stale read) + benchmarks. |
+| **M4** | Sweep & Shrink Engine | **DONE** | Parallel seed sweep runner, violation freeze, delta-debugging schedule shrinker. |
+| **M5** | Bug Gallery | **NEXT** | 6 planted bugs behind flags (ack before fsync, wrong quorum, stale term, unpersisted vote, early apply, stale read) + benchmarks. |
 | **M6** | Real Runtime (`/runtime/real`) | Pending | `simnode` binary, real TCP framing, append-only WAL with `fsync`, process manager (SIGKILL, SIGSTOP, restart). |
 | **M7** | Jepsen-Style Real Harness | Pending | TCP fault proxy, external nemesis fault orchestrator, 4-phase chaos workload, history cross-check. |
 | **M8** | Sim-vs-Real Study | Pending | Model-gap discovery, real fault schedule cross-replay in simulator, comparative evaluation. |
@@ -59,4 +59,16 @@
   5. *Linearizability Checker*: exact Wing & Gong concurrent register search algorithm handling indeterminate in-flight branches.
   6. *Determinism Checker*: byte-for-byte SHA-256 trace verification across repeated executions.
 - [x] **End-to-End Stress Verification**: 100/100 seeds tested twice with concurrent workload, multi-action fault injection (crashes, restarts, network partitions), snapshotting, and log compaction: 100/100 passed with 0 invariant violations and 0 determinism failures (`Det-Fail: 0`).
+
+---
+
+## M4 Details & Verification
+
+- [x] **Parallel Seed Runner (`sim/sweep.go`)**: Multi-core worker pool executing independent deterministic simulations in parallel. Achieved **76–200 seeds/sec** across CPU cores with full double-run determinism verification (`Det-Fail: 0`).
+- [x] **Delta-Debugging Schedule Shrinker (`sim/shrink.go`)**: Implemented Andreas Zeller's `ddmin` algorithm over both fault plans and client workload operations. Proved reduction from 9 faults and 25 client ops down to 2 faults and 3 ops (in 39 iterations, 0.15s) while preserving exact linearizability and durability invariant violations.
+- [x] **Planted Bug Framework (`types/types.go`, `node/raftnode/adapter.go`)**: Planted bug flags (`AckBeforeFsync`, `EarlyApply`, `UnpersistedVote`, etc.) integrated into `Config`, allowing reliable defect injection and shrinker evaluation.
+- [x] **API & CLI Integration (`server/server.go`, `cmd/m0spike/main.go`)**:
+  - `/api/sweep`: Multi-seed parallel execution with fast JSON response summaries.
+  - `/api/shrink`: REST endpoint returning minimal fault actions, reduced client operations, and frozen visual trace.
+  - CLI flags: `-parallel W` for multi-worker sweeps and `-shrink <seed>` for instant terminal delta-debugging.
 

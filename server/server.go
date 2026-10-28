@@ -46,6 +46,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/api/health", s.handleHealth)
 	s.mux.HandleFunc("/api/simulate", s.handleSimulate)
 	s.mux.HandleFunc("/api/sweep", s.handleSweep)
+	s.mux.HandleFunc("/api/shrink", s.handleShrink)
 
 	// Static web UI
 	if s.staticDir != "" {
@@ -183,6 +184,8 @@ func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 		DropRate:  0.05,
 		Partition: true,
 		NumPuts:   30,
+		Workload:  true,
+		Faults:    3,
 	}
 
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
@@ -197,45 +200,124 @@ func (s *Server) handleSweep(w http.ResponseWriter, r *http.Request) {
 		req.Count = 500
 	}
 
-	start := time.Now()
+	sweepCfg := sim.SweepConfig{
+		StartSeed:        req.StartSeed,
+		Count:            req.Count,
+		NumNodes:         req.NumNodes,
+		DropRate:         req.DropRate,
+		Faults:           req.Faults,
+		Workload:         req.Workload,
+		NumOps:           req.NumPuts,
+		CheckDeterminism: true,
+		MaxTimeSec:       25,
+	}
+
+	report := sim.RunSweep(sweepCfg)
+
 	resp := SweepResponse{
-		Total:   req.Count,
-		Results: make([]SweepItem, 0, req.Count),
+		Total:     report.Total,
+		Passed:    report.Passed,
+		Failed:    report.Failed,
+		WallDurMs: report.WallDurMs,
+		Results:   make([]SweepItem, len(report.Results)),
 	}
 
-	for i := 0; i < req.Count; i++ {
-		seed := req.StartSeed + uint64(i)
-		simReq := SimulateRequest{
-			Seed:          seed,
-			NumNodes:      req.NumNodes,
-			DropRate:      req.DropRate,
-			WithPartition: req.Partition,
-			NumPuts:       req.NumPuts,
-			MaxTimeSec:    25,
-			Faults:        req.Faults,
-			Workload:      req.Workload,
+	for i, r := range report.Results {
+		resp.Results[i] = SweepItem{
+			Seed:      r.Seed,
+			Passed:    r.Passed,
+			Events:    r.Events,
+			Duration:  r.Duration,
+			Violation: r.Violation,
+			TraceHash: r.TraceHash,
 		}
-		res := runSimulationTrace(simReq)
-		item := SweepItem{
-			Seed:      seed,
-			Passed:    res.Verdict.Passed,
-			Events:    len(res.Events),
-			Duration:  res.Meta.MaxTimeStr,
-			TraceHash: res.TraceHash,
-		}
-		if !res.Verdict.Passed && res.Verdict.Violation != nil {
-			item.Violation = res.Verdict.Violation.Detail
-			resp.Failed++
-		} else {
-			resp.Passed++
-		}
-		resp.Results = append(resp.Results, item)
 	}
-
-	resp.WallDurMs = time.Since(start).Milliseconds()
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
+}
+
+// ShrinkRequest holds parameters for delta-debugging shrinking.
+type ShrinkRequest struct {
+	Seed          uint64     `json:"seed"`
+	NumNodes      int        `json:"nodes"`
+	Faults        int        `json:"faults"`
+	Workload      bool       `json:"workload"`
+	NumOps        int        `json:"num_ops"`
+	DropRate      float64    `json:"drop_rate"`
+	MaxTimeSec    int        `json:"max_time_sec"`
+	TargetChecker string     `json:"target_checker,omitempty"`
+	Bugs          t.BugFlags `json:"bugs,omitempty"`
+}
+
+func (s *Server) handleShrink(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	var req ShrinkRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil && err.Error() != "EOF" {
+		http.Error(w, fmt.Sprintf("invalid shrink request: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	if req.NumNodes <= 0 {
+		req.NumNodes = 3
+	}
+	if req.MaxTimeSec <= 0 {
+		req.MaxTimeSec = 25
+	}
+	if req.NumOps <= 0 {
+		req.NumOps = 40
+	}
+
+	nodeIDs := make([]t.NodeID, req.NumNodes)
+	for i := 0; i < req.NumNodes; i++ {
+		nodeIDs[i] = t.NodeID(i + 1)
+	}
+
+	var initialPlan *sim.FaultPlan
+	if req.Faults > 0 {
+		faultRng := sim.NewRand(req.Seed).Fork("faults")
+		initialPlan = sim.GenerateRandomFaultPlan(faultRng, nodeIDs, t.Time(req.MaxTimeSec)*t.Second, req.Faults)
+	} else {
+		initialPlan = sim.NewFaultPlan()
+	}
+
+	var initialWorkload []harness.ScheduledClientReq
+	if req.Workload {
+		wcfg := harness.DefaultWorkloadConfig()
+		wcfg.NumOps = req.NumOps
+		wcfg.StartTime = 2 * t.Second
+		wcfg.EndTime = t.Time(req.MaxTimeSec-3) * t.Second
+		wRng := sim.NewRand(req.Seed).Fork("workload")
+		initialWorkload = harness.GenerateWorkload(wRng, nodeIDs, wcfg)
+	}
+
+	shrinker := sim.NewShrinker(sim.ShrinkInput{
+		Seed:          req.Seed,
+		NumNodes:      req.NumNodes,
+		MaxTimeSec:    req.MaxTimeSec,
+		DropRate:      req.DropRate,
+		FaultPlan:     initialPlan,
+		Workload:      initialWorkload,
+		Bugs:          req.Bugs,
+		TargetChecker: req.TargetChecker,
+	})
+
+	result, err := shrinker.Shrink()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("shrink error: %v", err), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
 }
 
 func runSimulationTrace(req SimulateRequest) *harness.RunTrace {

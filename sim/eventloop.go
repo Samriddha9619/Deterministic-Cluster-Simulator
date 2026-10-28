@@ -53,6 +53,9 @@ type SimConfig struct {
 	// AutoFaults, if > 0, generates a random fault plan up front from
 	// the dedicated "faults" RNG stream.
 	AutoFaults int
+
+	// Bugs holds planted bug flags for verification and shrinking.
+	Bugs t.BugFlags
 }
 
 // DefaultSimConfig returns a reasonable config for M0 testing.
@@ -173,6 +176,7 @@ func NewSimulator(cfg SimConfig) (*Simulator, error) {
 			HeartbeatTick: cfg.HeartbeatTick,
 			TickInterval:  cfg.TickInterval,
 			Rand:          raftRng,
+			Bugs:          cfg.Bugs,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("sim: create node %s: %w", id, err)

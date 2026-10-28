@@ -152,6 +152,108 @@ func (fp *FaultPlan) WithoutAction(idx int) *FaultPlan {
 	return clone
 }
 
+// WithoutRange returns a clone with the actions in [from, to) removed.
+func (fp *FaultPlan) WithoutRange(from, to int) *FaultPlan {
+	if from < 0 {
+		from = 0
+	}
+	if to > len(fp.Actions) {
+		to = len(fp.Actions)
+	}
+	if from >= to {
+		return fp.Clone()
+	}
+	clone := fp.Clone()
+	clone.Actions = append(clone.Actions[:from], clone.Actions[to:]...)
+	return clone
+}
+
+// SubRange returns a clone containing only actions in [from, to).
+func (fp *FaultPlan) SubRange(from, to int) *FaultPlan {
+	if from < 0 {
+		from = 0
+	}
+	if to > len(fp.Actions) {
+		to = len(fp.Actions)
+	}
+	if from >= to {
+		return NewFaultPlan()
+	}
+	clone := fp.Clone()
+	clone.Actions = clone.Actions[from:to]
+	return clone
+}
+
+// HumanSummary returns a concise description of actions in the plan.
+func (fp *FaultPlan) HumanSummary() string {
+	if len(fp.Actions) == 0 {
+		return "no faults"
+	}
+	counts := make(map[FaultKind]int)
+	for _, a := range fp.Actions {
+		counts[a.Kind]++
+	}
+
+	kinds := []FaultKind{FaultCrashNode, FaultRestartNode, FaultPartition, FaultHeal, FaultLinkCut, FaultLinkRestore}
+	var parts []string
+	for _, k := range kinds {
+		c := counts[k]
+		if c <= 0 {
+			continue
+		}
+		var name string
+		switch k {
+		case FaultCrashNode:
+			if c == 1 {
+				name = "1 crash"
+			} else {
+				name = fmt.Sprintf("%d crashes", c)
+			}
+		case FaultRestartNode:
+			if c == 1 {
+				name = "1 restart"
+			} else {
+				name = fmt.Sprintf("%d restarts", c)
+			}
+		case FaultPartition:
+			if c == 1 {
+				name = "1 partition"
+			} else {
+				name = fmt.Sprintf("%d partitions", c)
+			}
+		case FaultHeal:
+			if c == 1 {
+				name = "1 heal"
+			} else {
+				name = fmt.Sprintf("%d heals", c)
+			}
+		case FaultLinkCut:
+			if c == 1 {
+				name = "1 link cut"
+			} else {
+				name = fmt.Sprintf("%d link cuts", c)
+			}
+		case FaultLinkRestore:
+			if c == 1 {
+				name = "1 link restore"
+			} else {
+				name = fmt.Sprintf("%d link restores", c)
+			}
+		default:
+			name = fmt.Sprintf("%d %s", c, k)
+		}
+		parts = append(parts, name)
+	}
+	if len(parts) == 0 {
+		return fmt.Sprintf("%d actions", len(fp.Actions))
+	}
+	res := parts[0]
+	for i := 1; i < len(parts); i++ {
+		res += ", " + parts[i]
+	}
+	return res
+}
+
 // ToJSON formats the fault plan as JSON.
 func (fp *FaultPlan) ToJSON() ([]byte, error) {
 	return json.MarshalIndent(fp, "", "  ")

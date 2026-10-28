@@ -97,6 +97,7 @@ type Config struct {
 	TickInterval      t.Time     // virtual time per tick
 	Rand              t.Rand     // deterministic random source
 	SnapshotThreshold uint64     // entries applied before triggering snapshot & compaction (0 for default 50)
+	Bugs              t.BugFlags // planted bugs for verification
 }
 
 // discardLogger implements raft.Logger by discarding all output. We don't
@@ -272,7 +273,15 @@ func (n *RaftNode) OnClient(now t.Time, req t.ClientReq) t.Output {
 	// Track the pending proposal for response matching.
 	n.pendingProposals[req.RequestID] = req
 
-	return n.drainReady(now)
+	output := n.drainReady(now)
+	if n.cfg.Bugs.AckBeforeFsync && (req.Op == t.OpPut || req.Op == t.OpCAS || req.Op == t.OpDelete) {
+		output.Responses = append(output.Responses, t.ClientResp{
+			RequestID: req.RequestID,
+			OK:        true,
+			Value:     req.Value,
+		})
+	}
+	return output
 }
 
 // OnDiskDone is called when a previously requested disk operation completes.
@@ -332,9 +341,6 @@ func (n *RaftNode) OnDiskDone(now t.Time, result t.DiskOpResult) t.Output {
 // OnRestart is called after a crash to reinitialize the node from durable state.
 func (n *RaftNode) OnRestart(now t.Time, durable t.DiskImage) t.Output {
 	n.alive = true
-	n.pendingReady = nil
-	n.pendingProposals = make(map[uint64]t.ClientReq)
-
 	if len(durable.Data) == 0 {
 		return n.drainReady(now)
 	}
@@ -494,7 +500,17 @@ func (n *RaftNode) drainReady(now t.Time) t.Output {
 		n.durableState.KVState = n.kv.Clone()
 	}
 
-	if rd.MustSync {
+	if n.cfg.Bugs.EarlyApply {
+		for _, e := range rd.Entries {
+			if e.GetType() == pb.EntryNormal && len(e.GetData()) > 0 {
+				if cmd, err := kv.DecodeCommand(e.GetData()); err == nil {
+					_ = n.kv.Apply(cmd)
+				}
+			}
+		}
+	}
+
+	if rd.MustSync && !n.cfg.Bugs.AckBeforeFsync {
 		// Persistence required before sending messages.
 		diskData := n.serializeForDisk(rd)
 		n.nextDiskOpID++
@@ -507,7 +523,18 @@ func (n *RaftNode) drainReady(now t.Time) t.Output {
 		saved := rd
 		n.pendingReady = &saved
 	} else {
-		// No sync needed — send messages and apply immediately.
+		// If AckBeforeFsync is active, issue an unsynced volatile write that is lost on crash
+		if rd.MustSync && n.cfg.Bugs.AckBeforeFsync {
+			diskData := n.serializeForDisk(rd)
+			n.nextDiskOpID++
+			output.DiskOps = append(output.DiskOps, t.DiskOp{
+				OpID:   n.nextDiskOpID,
+				Type:   t.DiskWrite,
+				NodeID: n.id,
+				Data:   diskData,
+			})
+		}
+		// No sync needed or ack before sync — send messages and apply immediately.
 		for _, msg := range rd.Messages {
 			body, err := proto.Marshal(msg)
 			if err != nil {
@@ -573,6 +600,10 @@ func (n *RaftNode) applyEntry(entry *pb.Entry) []t.ClientResp {
 func (n *RaftNode) serializeForDisk(rd raft.Ready) []byte {
 	if rd.HardState != nil {
 		hsCopy := *rd.HardState
+		if n.cfg.Bugs.UnpersistedVote {
+			var zero uint64
+			hsCopy.Vote = &zero
+		}
 		n.durableState.HardState = &hsCopy
 	}
 	if len(rd.Entries) > 0 {
