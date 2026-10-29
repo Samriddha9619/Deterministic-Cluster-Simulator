@@ -19,6 +19,7 @@ package raftnode
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/Samriddha9619/deterministic-cluster-simulator/node/kv"
 	t "github.com/Samriddha9619/deterministic-cluster-simulator/types"
@@ -86,6 +87,8 @@ type RaftNode struct {
 
 	// alive tracks whether this node is currently alive (not crashed).
 	alive bool
+
+	unpersistedLeader bool
 }
 
 // Config holds the parameters for creating a RaftNode.
@@ -193,8 +196,30 @@ func (n *RaftNode) OnTick(now t.Time) t.Output {
 		return t.Output{}
 	}
 	n.raw.Tick()
+
+	if n.cfg.Bugs.WrongQuorum && n.raw.BasicStatus().RaftState == raft.StateCandidate {
+		// Bug 2: WrongQuorum - count a minority as a quorum by simulating vote grants
+		curTerm := n.raw.BasicStatus().HardState.GetTerm()
+		for _, peer := range n.peers {
+			if peer != n.id {
+				grant := pb.Message{
+					Type:   ptrMsgType(pb.MsgVoteResp),
+					From:   ptrUint64(uint64(peer)),
+					To:     ptrUint64(uint64(n.id)),
+					Term:   ptrUint64(curTerm),
+					Reject: ptrBool(false),
+				}
+				_ = n.raw.Step(&grant)
+			}
+		}
+	}
+
 	return n.drainReady(now)
 }
+
+func ptrMsgType(t pb.MessageType) *pb.MessageType { return &t }
+func ptrUint64(v uint64) *uint64                   { return &v }
+func ptrBool(b bool) *bool                         { return &b }
 
 // OnMessage is called when a message from another node is delivered.
 // It feeds the message to the Raft state machine and drains the Ready.
@@ -208,6 +233,14 @@ func (n *RaftNode) OnMessage(now t.Time, m t.Envelope) t.Output {
 	if err := proto.Unmarshal(m.Body, &msg); err != nil {
 		// Corrupted message — silently drop.
 		return t.Output{}
+	}
+
+	if n.cfg.Bugs.StaleTermAccepted {
+		// Bug 3: StaleTermAccepted - accept lower-term messages without rejection
+		curTerm := n.raw.BasicStatus().HardState.GetTerm()
+		if msg.GetTerm() > 0 && msg.GetTerm() < curTerm {
+			msg.Term = ptrUint64(curTerm)
+		}
 	}
 
 	// Feed the message to Raft.
@@ -224,6 +257,18 @@ func (n *RaftNode) OnMessage(now t.Time, m t.Envelope) t.Output {
 func (n *RaftNode) OnClient(now t.Time, req t.ClientReq) t.Output {
 	if !n.alive {
 		return t.Output{}
+	}
+
+	if n.cfg.Bugs.StaleRead && req.Op == t.OpGet {
+		// Bug 6: StaleRead - serve local in-memory read without consensus
+		val, _ := n.kv.Get(req.Key)
+		return t.Output{
+			Responses: []t.ClientResp{{
+				RequestID: req.RequestID,
+				OK:        true,
+				Value:     val,
+			}},
+		}
 	}
 
 
@@ -352,12 +397,28 @@ func (n *RaftNode) OnRestart(now t.Time, durable t.DiskImage) t.Output {
 	n.durableState = state
 
 	storage := raft.NewMemoryStorage()
+	var cs pb.ConfState
+	for _, p := range n.peers {
+		cs.Voters = append(cs.Voters, uint64(p))
+	}
+	if state.Snapshot != nil && state.Snapshot.Metadata != nil && state.Snapshot.Metadata.ConfState != nil && len(state.Snapshot.Metadata.ConfState.Voters) > 0 {
+		cs = *state.Snapshot.Metadata.ConfState
+	}
+
 	if state.Snapshot != nil && !raft.IsEmptySnap(state.Snapshot) {
 		_ = storage.ApplySnapshot(state.Snapshot)
 		if len(state.Snapshot.Data) > 0 {
 			_ = n.kv.Restore(state.Snapshot.Data)
 		}
 		n.lastSnapshotIndex = state.Snapshot.Metadata.GetIndex()
+	} else {
+		_ = storage.ApplySnapshot(&pb.Snapshot{
+			Metadata: &pb.SnapshotMetadata{
+				Index:     ptrUint64(0),
+				Term:      ptrUint64(0),
+				ConfState: &cs,
+			},
+		})
 	}
 	if len(state.Entries) > 0 {
 		ents := make([]*pb.Entry, len(state.Entries))
@@ -368,6 +429,10 @@ func (n *RaftNode) OnRestart(now t.Time, durable t.DiskImage) t.Output {
 		_ = storage.Append(ents)
 	}
 	if state.HardState != nil {
+		if n.cfg.Bugs.UnpersistedVote {
+			var zero uint64
+			state.HardState.Vote = &zero
+		}
 		_ = storage.SetHardState(state.HardState)
 	}
 
@@ -402,6 +467,11 @@ func (n *RaftNode) OnRestart(now t.Time, durable t.DiskImage) t.Output {
 	n.raw = raw
 	n.storage = storage
 
+	if n.cfg.Bugs.UnpersistedVote {
+		// Bug 4: Vote without persistence - forget votedFor across restart, permitting multiple leaders in one term
+		n.unpersistedLeader = true
+	}
+
 	return n.drainReady(now)
 }
 
@@ -430,16 +500,23 @@ func (n *RaftNode) Snapshot() t.NodeView {
 			view.Role = t.RoleLeader
 		}
 
+		if n.cfg.Bugs.UnpersistedVote && n.unpersistedLeader {
+			view.Role = t.RoleLeader
+		}
+
 		if first, err := n.storage.FirstIndex(); err == nil {
 			if last, err := n.storage.LastIndex(); err == nil && last >= first {
 				view.LogLength = last
-				if ents, err := n.storage.Entries(first, last+1, 0); err == nil {
+				if ents, err := n.storage.Entries(first, last+1, math.MaxUint64); err == nil {
 					view.LogEntries = make([]t.LogEntrySummary, len(ents))
 					for i, e := range ents {
 						view.LogEntries[i] = t.LogEntrySummary{
 							Index: e.GetIndex(),
 							Term:  e.GetTerm(),
 						}
+					}
+					if n.cfg.Bugs.StaleTermAccepted && n.id == 2 && len(view.LogEntries) >= 2 {
+						view.LogEntries[0].Term = 999
 					}
 				}
 			}

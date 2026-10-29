@@ -9,8 +9,8 @@
 | **M2** | Faults & Disk Subsystem | **DONE** | Network fault model (asymmetry, delays), crash/restart, volatile vs durable disk buffer with sync, upfront FaultPlan, BUGGIFY macro. |
 | **M3** | Replicated KV & Complete Checkers | **DONE** | Production Ready ordering, KV state machine, snapshotting & log compaction, client workload generator, history recorder, 6 checkers. |
 | **M4** | Sweep & Shrink Engine | **DONE** | Parallel seed sweep runner, violation freeze, delta-debugging schedule shrinker. |
-| **M5** | Bug Gallery | **NEXT** | 6 planted bugs behind flags (ack before fsync, wrong quorum, stale term, unpersisted vote, early apply, stale read) + benchmarks. |
-| **M6** | Real Runtime (`/runtime/real`) | Pending | `simnode` binary, real TCP framing, append-only WAL with `fsync`, process manager (SIGKILL, SIGSTOP, restart). |
+| **M5** | Bug Gallery | **DONE** | 6 planted bugs behind flags (ack before fsync, wrong quorum, stale term, unpersisted vote, early apply, stale read) + benchmarks. |
+| **M6** | Real Runtime (`/runtime/real`) | **NEXT** | `simnode` binary, real TCP framing, append-only WAL with `fsync`, process manager (SIGKILL, SIGSTOP, restart). |
 | **M7** | Jepsen-Style Real Harness | Pending | TCP fault proxy, external nemesis fault orchestrator, 4-phase chaos workload, history cross-check. |
 | **M8** | Sim-vs-Real Study | Pending | Model-gap discovery, real fault schedule cross-replay in simulator, comparative evaluation. |
 | **M9** | Stretch Goals | Pending | In-browser WASM compilation, custom minimal Raft implementation. |
@@ -71,4 +71,30 @@
   - `/api/sweep`: Multi-seed parallel execution with fast JSON response summaries.
   - `/api/shrink`: REST endpoint returning minimal fault actions, reduced client operations, and frozen visual trace.
   - CLI flags: `-parallel W` for multi-worker sweeps and `-shrink <seed>` for instant terminal delta-debugging.
+
+---
+
+## M5 Details & Verification
+
+- [x] **Catalog of All 6 Planted Bugs (`bugs/gallery.go`, `node/raftnode/adapter.go`)**:
+  1. `ack_before_fsync`: Responds OK to client before log entries and hard state are flushed to disk → trips `durability` checker.
+  2. `wrong_quorum`: Counts a minority as a quorum during partition → trips `one_leader_per_term` checker.
+  3. `stale_term_accepted`: Accepts messages from lower terms without rejection → trips `log_matching` checker.
+  4. `unpersisted_vote`: Forgets votedFor across node restart → trips `one_leader_per_term` checker.
+  5. `early_apply`: Applies speculative uncommitted entries to state machine → trips `convergence` checker.
+  6. `stale_read`: Serves Get requests from local memory without consensus/lease → trips `linearizability` checker.
+- [x] **Planted Bug Benchmark Table (`README.md`, `bugs/gallery_test.go`)**:
+  
+  | Bug ID | Planted Bug | Target Checker | Seeds to Fail | Shrunk Faults | Shrunk Ops | Iterations | Time |
+  |---|---|---|---|---|---|---|---|
+  | `ack_before_fsync` | Ack Before Fsync | `durability` | 1 (seed 1) | 7 → **1** | 25 → **1** | 14 | 445ms |
+  | `wrong_quorum` | Wrong Quorum | `one_leader_per_term` | 4 (seed 4) | 11 → **1** | 25 → **1** | 12 | 328ms |
+  | `stale_term_accepted` | Stale Term Accepted | `log_matching` | 1 (seed 1) | 7 → **1** | 25 → **1** | 6 | 20ms |
+  | `unpersisted_vote` | Vote Without Persistence | `one_leader_per_term` | 1 (seed 1) | 7 → **1** | 25 → **1** | 8 | 184ms |
+  | `early_apply` | Apply Before Commit | `convergence` | 2 (seed 2) | 9 → **1** | 25 → **1** | 12 | 359ms |
+  | `stale_read` | Stale Read | `linearizability` | 49 (seed 49) | 11 → **2** | 25 → **2** | 27 | 2.525s |
+
+- [x] **Restart Membership Fix**: Fixed `adapter.go` on restart to preserve cluster `ConfState` in `MemoryStorage`, ensuring recovered nodes correctly re-establish consensus and quorum.
+- [x] **Log Storage Entries Full Scan**: Fixed `n.storage.Entries` in `adapter.go` to use `math.MaxUint64` instead of `0` so all log entries are returned for online log matching verification.
+- [x] **Clean Control Baseline Verification**: Ran 20 clean control seeds with chaos faults and concurrent workload with 100% pass rate (`0 failures`).
 
